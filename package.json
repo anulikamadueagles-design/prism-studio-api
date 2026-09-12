@@ -1,7 +1,7 @@
 {
   "name": "prism-studio-api",
   "version": "1.0.0",
-  "description": "Shared AI backend for Prism Studio (Element Tech) — proxies Claude vision calls so no visitor needs their own Anthropic API key.",
+  "description": "Shared AI backend for Prism Studio (Element Tech) — proxies Gemini vision calls so no visitor needs their own API key.",
   "main": "server.js",
   "engines": {
     "node": ">=18"

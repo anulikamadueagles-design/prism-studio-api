@@ -1,8 +1,8 @@
 // Prism Studio API — Element Tech
 // A small shared backend so every visitor to Prism Studio can use the
-// AI Edit Assistant without needing their own Anthropic API key. The
-// key lives only here, as a server environment variable, and is never
-// sent to the browser.
+// AI Edit Assistant without needing their own API key. The key lives
+// only here, as a server environment variable, and is never sent to
+// the browser. Uses Google's Gemini API (has a free tier).
 
 const express = require('express');
 const cors = require('cors');
@@ -12,17 +12,20 @@ app.use(cors());
 app.use(express.json({ limit: '8mb' })); // frames are base64 JPEGs, give some headroom
 
 const PORT = process.env.PORT || 3000;
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const MODEL = process.env.ANTHROPIC_MODEL || 'claude-sonnet-5';
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+// "gemini-flash-latest" is Google's rolling alias to their current
+// recommended fast model, so this keeps working as Gemini versions
+// come and go. Override with GEMINI_MODEL if you want to pin one.
+const MODEL = process.env.GEMINI_MODEL || 'gemini-flash-latest';
 
-if (!ANTHROPIC_API_KEY) {
-  console.warn('WARNING: ANTHROPIC_API_KEY is not set. /api/ai-edit and /api/ai-caption will return errors until it is added in Render → Environment.');
+if (!GEMINI_API_KEY) {
+  console.warn('WARNING: GEMINI_API_KEY is not set. /api/ai-edit and /api/ai-caption will return errors until it is added in Render → Environment.');
 }
 
 /* ---------------------------------------------------------------
    Tiny in-memory per-IP rate limiter.
    This is a shared key used by every visitor, so this cap protects
-   your Anthropic bill from any single visitor (or bot) hammering it.
+   your Gemini quota from any single visitor (or bot) hammering it.
    It resets whenever the server restarts/redeploys — fine for a
    small shared tool, not meant to be bulletproof.
 --------------------------------------------------------------- */
@@ -43,35 +46,37 @@ function rateLimit(req, res, next) {
 }
 
 /* ---------------------------------------------------------------
-   Anthropic call
+   Gemini call
 --------------------------------------------------------------- */
-async function callClaude(imageBase64, systemPrompt, userText, maxTokens) {
-  const resp = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
+async function callGemini(imageBase64, systemPrompt, userText, opts = {}) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
+  const body = {
+    system_instruction: { parts: [{ text: systemPrompt }] },
+    contents: [{
+      role: 'user',
+      parts: [
+        { inline_data: { mime_type: 'image/jpeg', data: imageBase64 } },
+        { text: userText },
+      ],
+    }],
+    generationConfig: {
+      maxOutputTokens: opts.maxTokens || 400,
+      ...(opts.json ? { responseMimeType: 'application/json' } : {}),
     },
-    body: JSON.stringify({
-      model: MODEL,
-      max_tokens: maxTokens || 400,
-      system: systemPrompt,
-      messages: [{
-        role: 'user',
-        content: [
-          { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: imageBase64 } },
-          { type: 'text', text: userText },
-        ],
-      }],
-    }),
+  };
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY },
+    body: JSON.stringify(body),
   });
   if (!resp.ok) {
     const errText = await resp.text().catch(() => '');
-    throw new Error(`Anthropic API error ${resp.status}: ${errText.slice(0, 300)}`);
+    throw new Error(`Gemini API error ${resp.status}: ${errText.slice(0, 300)}`);
   }
   const data = await resp.json();
-  return (data.content || []).map(b => b.text || '').join('\n').trim();
+  const cand = data.candidates && data.candidates[0];
+  const parts = cand && cand.content && cand.content.parts;
+  return (parts ? parts.map(p => p.text || '').join('\n') : '').trim();
 }
 
 const AI_EDIT_SYSTEM = `You are a professional color grading and reframing assistant built into a video editor called Prism Studio. You are shown one still frame from a clip and a plain-language instruction from the editor. Respond with ONLY a raw JSON object — no markdown fences, no prose before or after — matching exactly this shape:
@@ -98,20 +103,20 @@ function clamp(v, lo, hi, fallback) {
    Routes
 --------------------------------------------------------------- */
 app.get('/', (req, res) => {
-  res.json({ service: 'prism-studio-api', status: 'ok' });
+  res.json({ service: 'prism-studio-api', status: 'ok', provider: 'gemini' });
 });
 
 app.get('/api/health', (req, res) => {
-  res.json({ ok: true, service: 'prism-studio-api', hasKey: !!ANTHROPIC_API_KEY });
+  res.json({ ok: true, service: 'prism-studio-api', provider: 'gemini', hasKey: !!GEMINI_API_KEY });
 });
 
 app.post('/api/ai-edit', rateLimit, async (req, res) => {
   try {
     const { imageBase64, instruction } = req.body || {};
     if (!imageBase64) return res.status(400).json({ error: 'imageBase64 is required' });
-    if (!ANTHROPIC_API_KEY) return res.status(500).json({ error: 'Server is missing ANTHROPIC_API_KEY' });
+    if (!GEMINI_API_KEY) return res.status(500).json({ error: 'Server is missing GEMINI_API_KEY' });
 
-    const raw = await callClaude(imageBase64, AI_EDIT_SYSTEM, instruction || 'Improve this shot.', 400);
+    const raw = await callGemini(imageBase64, AI_EDIT_SYSTEM, instruction || 'Improve this shot.', { maxTokens: 400, json: true });
     const clean = raw.replace(/```json|```/g, '').trim();
     const start = clean.indexOf('{'), end = clean.lastIndexOf('}');
     const parsed = JSON.parse(clean.slice(start, end + 1));
@@ -138,9 +143,9 @@ app.post('/api/ai-caption', rateLimit, async (req, res) => {
   try {
     const { imageBase64 } = req.body || {};
     if (!imageBase64) return res.status(400).json({ error: 'imageBase64 is required' });
-    if (!ANTHROPIC_API_KEY) return res.status(500).json({ error: 'Server is missing ANTHROPIC_API_KEY' });
+    if (!GEMINI_API_KEY) return res.status(500).json({ error: 'Server is missing GEMINI_API_KEY' });
 
-    const raw = await callClaude(imageBase64, AI_CAPTION_SYSTEM, 'Write the caption.', 60);
+    const raw = await callGemini(imageBase64, AI_CAPTION_SYSTEM, 'Write the caption.', { maxTokens: 60 });
     const caption = raw.replace(/^["']|["']$/g, '').trim();
     res.json({ caption });
   } catch (err) {
